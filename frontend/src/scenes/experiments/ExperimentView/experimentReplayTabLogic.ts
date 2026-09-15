@@ -535,7 +535,7 @@ export interface experimentReplayTabLogicActions {
         scope: ExperimentReplayExposureScope
     }
     setMetricFilterMode: (mode: ExperimentReplayMetricFilterMode) => {
-        mode: ExperimentReplayMetricFilterMode
+        mode: 'fired_all' | 'fired_any' | 'funnel_completed' | 'funnel_dropoff' | 'no_metric_activity'
     }
     setMetricSelected: (
         metricUuid: string,
@@ -626,18 +626,18 @@ export interface experimentReplayTabLogicMeta {
         filterContext: (
             effectiveVariantKey: string | null,
             effectiveExposureScope: ExperimentReplayExposureScope,
-            metricFilterMode: ExperimentReplayMetricFilterMode,
+            metricFilterMode: 'fired_all' | 'fired_any' | 'funnel_completed' | 'funnel_dropoff' | 'no_metric_activity',
             effectiveMetricUuids: string[],
             bucketSessionIds: string[] | undefined,
             selectedWatchCard: ExperimentWatchCardApi | null,
-            entryPoint: ExperimentRecordingsEntryPoint | null
+            entryPoint: 'results_row' | null
         ) => ExperimentRecordingsFilterContext
         tabViewContext: (
             variantKeys: string[],
             metricOptions: ExperimentReplayMetricOption[],
             effectiveExposureScope: ExperimentReplayExposureScope,
             inSessionExposure: ExperimentInSessionExposureApi | null,
-            entryPoint: ExperimentRecordingsEntryPoint | null
+            entryPoint: 'results_row' | null
         ) => ExperimentRecordingsTabContext
         metricOptions: (
             linkabilityLoaded: boolean,
@@ -647,10 +647,10 @@ export interface experimentReplayTabLogicMeta {
         effectiveMetricUuids: (
             selectedMetricUuids: string[],
             metricOptions: ExperimentReplayMetricOption[],
-            metricFilterMode: ExperimentReplayMetricFilterMode
+            metricFilterMode: 'fired_all' | 'fired_any' | 'funnel_completed' | 'funnel_dropoff' | 'no_metric_activity'
         ) => string[]
         sessionBucketRequest: (
-            metricFilterMode: ExperimentReplayMetricFilterMode,
+            metricFilterMode: 'fired_all' | 'fired_any' | 'funnel_completed' | 'funnel_dropoff' | 'no_metric_activity',
             effectiveMetricUuids: string[],
             effectiveVariantKey: string | null,
             metricOptions: ExperimentReplayMetricOption[]
@@ -665,7 +665,7 @@ export interface experimentReplayTabLogicMeta {
             effectiveExposureScope: ExperimentReplayExposureScope,
             effectiveMetricUuids: string[],
             metricOptions: ExperimentReplayMetricOption[],
-            metricFilterMode: ExperimentReplayMetricFilterMode,
+            metricFilterMode: 'fired_all' | 'fired_any' | 'funnel_completed' | 'funnel_dropoff' | 'no_metric_activity',
             unlinkableEventNames: Set<string>,
             seenTogetherMapLoading: boolean,
             bucketSessionIds: string[] | undefined,
