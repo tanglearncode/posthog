@@ -85,6 +85,7 @@ import {
 import { getMetricUnlinkableReason, viewRecordingsLinkabilityLogic } from '../viewRecordingsLinkabilityLogic'
 import {
     type ExperimentRecordingsDeepLink,
+    type ExperimentRecordingsEntryPoint,
     type ExperimentReplayMetricFilterMode,
     EXPERIMENT_RECORDINGS_DEEP_LINK_PARAMS,
     isFunnelMode,
@@ -146,13 +147,6 @@ export type ExperimentReplayRecording = Pick<SessionRecordingType, 'id' | 'recor
 
 /** The link an empty "what to watch" state offers, as reported to telemetry. */
 export type ExperimentWatchEmptyAction = 'exposure_docs' | 'replay_settings'
-
-/**
- * Where the tab's current state was set from, when it was not the viewer moving the controls. Only
- * a deep link sets one, so telemetry can compare a list a results row opened against one somebody
- * narrowed by hand.
- */
-export type ExperimentRecordingsEntryPoint = 'results_row'
 
 /** The action an empty recordings list offers for its reason, as reported to telemetry. */
 export type ExperimentRecordingsEmptyAction =
@@ -630,14 +624,14 @@ export interface experimentReplayTabLogicMeta {
             effectiveMetricUuids: string[],
             bucketSessionIds: string[] | undefined,
             selectedWatchCard: ExperimentWatchCardApi | null,
-            entryPoint: 'results_row' | null
+            entryPoint: 'results_button' | 'results_menu' | null
         ) => ExperimentRecordingsFilterContext
         tabViewContext: (
             variantKeys: string[],
             metricOptions: ExperimentReplayMetricOption[],
             effectiveExposureScope: ExperimentReplayExposureScope,
             inSessionExposure: ExperimentInSessionExposureApi | null,
-            entryPoint: 'results_row' | null
+            entryPoint: 'results_button' | 'results_menu' | null
         ) => ExperimentRecordingsTabContext
         metricOptions: (
             linkabilityLoaded: boolean,
@@ -1043,7 +1037,7 @@ export const experimentReplayTabLogic = kea<experimentReplayTabLogicType>([
         entryPoint: [
             null as ExperimentRecordingsEntryPoint | null,
             {
-                applyDeepLink: () => 'results_row' as ExperimentRecordingsEntryPoint,
+                applyDeepLink: (_, { link }) => link.entry,
                 setSelectedVariantKey: () => null,
                 setExposureScope: () => null,
                 setMetricSelected: () => null,
@@ -1304,6 +1298,7 @@ export const experimentReplayTabLogic = kea<experimentReplayTabLogicType>([
                 s.bucketSessionIds,
                 s.selectedWatchCard,
                 s.entryPoint,
+                s.filtersCustomized,
             ],
             (
                 effectiveVariantKey: string | null,
@@ -1312,7 +1307,8 @@ export const experimentReplayTabLogic = kea<experimentReplayTabLogicType>([
                 effectiveMetricUuids: string[],
                 bucketSessionIds: string[] | undefined,
                 selectedWatchCard: ExperimentWatchCardApi | null,
-                entryPoint: ExperimentRecordingsEntryPoint | null
+                entryPoint: ExperimentRecordingsEntryPoint | null,
+                filtersCustomized: boolean
             ): ExperimentRecordingsFilterContext => ({
                 variant: effectiveVariantKey,
                 exposure_scope: effectiveExposureScope,
@@ -1320,7 +1316,10 @@ export const experimentReplayTabLogic = kea<experimentReplayTabLogicType>([
                 selected_metric_count: effectiveMetricUuids.length,
                 is_bucketed: bucketSessionIds !== undefined,
                 watch_card_kind: selectedWatchCard?.kind ?? null,
-                entry_point: entryPoint,
+                // A filter the viewer added in the playlist bar narrows the list past what the link
+                // asked for, the same as moving one of the tab's own facets. Read off the playlist
+                // rather than its change action, which also fires on the tab's own pushes.
+                entry_point: filtersCustomized ? null : entryPoint,
             }),
         ],
         // The `experiment recordings tab viewed` payload, in a selector so the settled-checks
