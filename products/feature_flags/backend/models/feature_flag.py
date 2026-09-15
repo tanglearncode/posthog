@@ -185,8 +185,18 @@ class FeatureFlag(FileSystemSyncMixin, ModelActivityMixin, RootTeamMixin, models
     # whether a feature is sending us rich analytics, like views & interactions.
     has_enriched_analytics = models.BooleanField(default=False, null=True, blank=True)
 
-    is_remote_configuration = models.BooleanField(default=False, null=True, blank=True)
-    has_encrypted_payloads = models.BooleanField(default=False, null=True, blank=True)
+    is_remote_configuration = models.BooleanField(
+        default=False,
+        null=True,
+        blank=True,
+        help_text="Whether this flag delivers a remote configuration payload. This must be true when has_encrypted_payloads is true.",
+    )
+    has_encrypted_payloads = models.BooleanField(
+        default=False,
+        null=True,
+        blank=True,
+        help_text="Whether to encrypt the remote configuration payload. This can be true only when is_remote_configuration is true.",
+    )
 
     EVALUATION_RUNTIME_CHOICES = [
         ("server", "Server"),
@@ -238,6 +248,12 @@ class FeatureFlag(FileSystemSyncMixin, ModelActivityMixin, RootTeamMixin, models
             # An archived flag must be disabled — keeps an archived flag from ever serving traffic,
             # regardless of which code path wrote it.
             models.CheckConstraint(condition=~Q(archived=True, active=True), name="archived_flag_must_be_disabled"),
+            models.CheckConstraint(
+                # PostgreSQL accepts CHECK expressions that evaluate to NULL.
+                condition=~Q(has_encrypted_payloads=True)
+                | Q(is_remote_configuration=True, is_remote_configuration__isnull=False),
+                name="encrypted_payloads_require_remote_config",
+            ),
         ]
         db_table = "posthog_featureflag"
 
@@ -266,12 +282,7 @@ class FeatureFlag(FileSystemSyncMixin, ModelActivityMixin, RootTeamMixin, models
         return self.key
 
     def clean(self) -> None:
-        """Reject encrypted payloads on non-remote-config flags.
-
-        Django does not invoke clean() from save(), so this fires only from
-        admin and explicit full_clean() callers. The HTTP path is gated by
-        FeatureFlagSerializer._validate_encrypted_payloads_require_remote_config.
-        """
+        """Raise ValidationError when encrypted payloads lack remote configuration."""
         super().clean()
         if self.has_encrypted_payloads and not self.is_remote_configuration:
             raise ValidationError("Encrypted payloads require the flag to be a remote configuration.")

@@ -1,5 +1,9 @@
 from posthog.test.base import BaseTest
 
+from django.db import IntegrityError, transaction
+
+from parameterized import parameterized
+
 from products.feature_flags.backend.models.feature_flag import FeatureFlag
 
 
@@ -36,6 +40,57 @@ class TestExperimentEligibility(BaseTest):
 
 
 class TestFeatureFlagManager(BaseTest):
+    @parameterized.expand([(False,), (None,)])
+    def test_encrypted_payloads_require_remote_configuration(self, is_remote_configuration: bool | None) -> None:
+        with self.assertRaisesRegex(IntegrityError, "encrypted_payloads_require_remote_config"):
+            with transaction.atomic():
+                FeatureFlag.objects.create(
+                    team=self.team,
+                    key="invalid-encrypted-flag",
+                    is_remote_configuration=is_remote_configuration,
+                    has_encrypted_payloads=True,
+                )
+
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            key="encrypted-remote-config",
+            is_remote_configuration=True,
+            has_encrypted_payloads=True,
+        )
+
+        with self.assertRaisesRegex(IntegrityError, "encrypted_payloads_require_remote_config"):
+            with transaction.atomic():
+                FeatureFlag.objects.filter(pk=flag.pk).update(is_remote_configuration=is_remote_configuration)
+
+        flag.refresh_from_db()
+        assert flag.is_remote_configuration is True
+        assert flag.has_encrypted_payloads is True
+
+    @parameterized.expand(
+        [
+            (False, False),
+            (True, False),
+            (True, True),
+            (None, False),
+            (False, None),
+            (True, None),
+            (None, None),
+        ]
+    )
+    def test_payload_encryption_allows_valid_configuration(
+        self, is_remote_configuration: bool | None, has_encrypted_payloads: bool | None
+    ) -> None:
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            key="valid-payload-encryption",
+            is_remote_configuration=is_remote_configuration,
+            has_encrypted_payloads=has_encrypted_payloads,
+        )
+
+        flag.refresh_from_db()
+        assert flag.is_remote_configuration is is_remote_configuration
+        assert flag.has_encrypted_payloads is has_encrypted_payloads
+
     def test_default_manager_excludes_soft_deleted_flags(self):
         FeatureFlag.objects.create(team=self.team, key="live", created_by=self.user)
         deleted_flag = FeatureFlag.objects_including_soft_deleted.create(

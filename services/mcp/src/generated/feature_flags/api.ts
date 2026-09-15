@@ -458,7 +458,7 @@ export const FeatureFlagsCreateBody = () => zod.object({
         .boolean()
         .nullish()
         .describe(
-            'Whether this flag is a remote configuration flag that delivers a payload rather than gating a feature.'
+            'Whether this flag delivers a remote configuration payload. This must be true when has_encrypted_payloads is true.'
         ),
     ensure_experience_continuity: zod
         .boolean()
@@ -840,7 +840,7 @@ export const FeatureFlagsPartialUpdateBody = () => zod.object({
         .boolean()
         .nullish()
         .describe(
-            'Whether this flag is a remote configuration flag that delivers a payload rather than gating a feature.'
+            'Whether this flag delivers a remote configuration payload. This must be true when has_encrypted_payloads is true.'
         ),
     ensure_experience_continuity: zod
         .boolean()

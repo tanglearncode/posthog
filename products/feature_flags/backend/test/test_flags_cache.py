@@ -283,25 +283,15 @@ class TestServiceFlagsCache(BaseTest):
         [
             # (is_remote_config, has_encrypted, should_include, description)
             (False, False, True, "regular_flag"),
-            (False, True, False, "encrypted_but_not_remote_config"),
             (True, False, True, "unencrypted_remote_config"),
             (True, True, False, "encrypted_remote_config"),
             (None, False, True, "null_remote_config_unencrypted"),
-            (None, True, False, "null_remote_config_encrypted"),
             (False, None, True, "regular_flag_null_encrypted"),
             (True, None, True, "remote_config_null_encrypted"),
             (None, None, True, "legacy_flag_both_null"),
         ]
     )
     def test_filtering_matrix_for_service(self, is_remote_config, has_encrypted, should_include, desc):
-        """Test filtering behavior for all combinations of is_remote_configuration and has_encrypted_payloads.
-
-        Any flag with has_encrypted_payloads=True is excluded — these can only be
-        accessed via /remote_config. The model invariant (clean() + serializer
-        validation) guarantees True implies is_remote_configuration=True, but the
-        filter is intentionally strict to defend against invariant violations.
-        NULL has_encrypted_payloads is preserved (legacy flags pre-dating the field).
-        """
         FeatureFlag.objects.create(
             team=self.team,
             key=f"flag-{desc}",
@@ -323,18 +313,15 @@ class TestServiceFlagsCache(BaseTest):
         [
             # (is_remote_config, has_encrypted, should_include, description)
             (False, False, True, "regular_flag"),
-            (False, True, False, "encrypted_but_not_remote_config"),
             (True, False, True, "unencrypted_remote_config"),
             (True, True, False, "encrypted_remote_config"),
             (None, False, True, "null_remote_config_unencrypted"),
-            (None, True, False, "null_remote_config_encrypted"),
             (False, None, True, "regular_flag_null_encrypted"),
             (True, None, True, "remote_config_null_encrypted"),
             (None, None, True, "legacy_flag_both_null"),
         ]
     )
     def test_filtering_matrix_for_teams_batch(self, is_remote_config, has_encrypted, should_include, desc):
-        """Mirrors test_filtering_matrix_for_service for the batch loader path."""
         FeatureFlag.objects.create(
             team=self.team,
             key=f"flag-{desc}",

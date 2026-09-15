@@ -695,10 +695,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_null_values_included_in_pg_query() {
-        // Verify that flags with NULL values for is_remote_configuration and/or
-        // has_encrypted_payloads are correctly included (not excluded by the filter).
-        // This tests the IS TRUE logic: NULL IS TRUE evaluates to FALSE, so
-        // NOT (NULL IS TRUE AND ...) evaluates to TRUE, including the row.
+        // Legacy flags with NULL fields remain readable when their payloads are unencrypted.
         let context = TestContext::new(None).await;
         let team = context
             .insert_new_team(None)
@@ -756,28 +753,11 @@ mod tests {
         .await
         .expect("Failed to insert legacy flag");
 
-        // Insert flag with is_remote_configuration = NULL, has_encrypted_payloads = true
-        // This should still be included because is_remote_configuration is not TRUE
-        sqlx::query(
-            r#"INSERT INTO posthog_featureflag
-            (team_id, name, key, filters, deleted, active, ensure_experience_continuity,
-             is_remote_configuration, has_encrypted_payloads, created_at)
-            VALUES ($1, $2, $3, $4, false, true, false, NULL, true, '2024-06-17')"#,
-        )
-        .bind(team.id)
-        .bind("Null Remote Encrypted True Flag")
-        .bind("null_remote_encrypted_true")
-        .bind(serde_json::json!({"groups": [{"properties": [], "rollout_percentage": 100}]}))
-        .execute(&mut *conn)
-        .await
-        .expect("Failed to insert null remote encrypted true flag");
-
         let flags_from_pg = FeatureFlagList::from_pg(context.non_persons_reader.clone(), team.id)
             .await
             .expect("Failed to fetch flags from pg");
 
-        // All flags with NULL values should be included
-        assert_eq!(flags_from_pg.len(), 4);
+        assert_eq!(flags_from_pg.len(), 3);
 
         let flag_keys: Vec<&str> = flags_from_pg.iter().map(|f| f.key.as_str()).collect();
         assert!(
@@ -791,10 +771,6 @@ mod tests {
         assert!(
             flag_keys.contains(&"legacy_flag"),
             "Legacy flag with both NULL should be included"
-        );
-        assert!(
-            flag_keys.contains(&"null_remote_encrypted_true"),
-            "Flag with NULL is_remote_configuration and TRUE has_encrypted_payloads should be included"
         );
     }
 

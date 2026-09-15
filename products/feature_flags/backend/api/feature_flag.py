@@ -1123,7 +1123,7 @@ class FeatureFlagCreateRequestSchemaSerializer(serializers.Serializer):
     is_remote_configuration = serializers.BooleanField(
         required=False,
         allow_null=True,
-        help_text="Whether this flag is a remote configuration flag that delivers a payload rather than gating a feature.",
+        help_text=FeatureFlag._meta.get_field("is_remote_configuration").help_text,
     )
     ensure_experience_continuity = serializers.BooleanField(
         required=False,
@@ -1173,7 +1173,7 @@ class FeatureFlagPartialUpdateRequestSchemaSerializer(serializers.Serializer):
     is_remote_configuration = serializers.BooleanField(
         required=False,
         allow_null=True,
-        help_text="Whether this flag is a remote configuration flag that delivers a payload rather than gating a feature.",
+        help_text=FeatureFlag._meta.get_field("is_remote_configuration").help_text,
     )
     ensure_experience_continuity = serializers.BooleanField(
         required=False,
