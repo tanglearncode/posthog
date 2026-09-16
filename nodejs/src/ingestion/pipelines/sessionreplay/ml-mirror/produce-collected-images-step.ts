@@ -1,0 +1,112 @@
+import { IngestionOutputs } from '~/common/outputs/ingestion-outputs'
+import { logger } from '~/common/utils/logger'
+import { ok } from '~/ingestion/framework/results'
+import { ProcessingStep } from '~/ingestion/framework/steps'
+import { CAPTURE_TIMESTAMP_HEADER } from '~/ingestion/pipelines/sessionreplay/ml-mirror-image-scrub/image-transport'
+import { ML_IMAGE_SCRUB_OUTPUT, MlImageScrubOutput } from '~/ingestion/pipelines/sessionreplay/shared/outputs'
+import { RefDedupCache } from '~/ingestion/pipelines/sessionreplay/shared/ref-dedup-cache'
+
+import { MlMirrorMetrics } from './metrics'
+import { CollectedImage } from './parse-and-anonymize-step'
+import { MlPrivacyBatchController } from './privacy/batch-controller'
+import { encryptedKafkaValue, mlWireVersion, validateImageOwner } from './privacy/transport'
+import { usesRawSessionIdentifiers } from './session-identifier-format'
+
+/**
+ * The Rust collector only dedupes within one message, leaving this as the sole thing between a hot
+ * sprite and one produce per recurrence, so capacity translates directly into scrub-topic volume: a
+ * ref evicted before its next sighting is re-produced and re-scrubbed. Budget ~200 B per entry (the
+ * LRU's bookkeeping dominates the ~60 B ref), so this is ~100 MB against the 8000M mirror container
+ * in https://github.com/PostHog/charts/blob/main/apps/ingestion-sessionreplay-ml-mirror/values.yaml,
+ * which also holds the anonymizer's packed image buffers. Overflowing it costs topic bytes rather
+ * than correctness, since the consumer dedupes by ref too.
+ */
+const PRODUCED_REF_CACHE_MAX = 500_000
+
+/**
+ * Produce collected original images to the scrub topic as a fire-and-forget side effect, keyed by
+ * their `image:<teamId>:<hash>` ref. Delivery is deliberately not awaited and never blocks or
+ * fails the message: the mirrored lines already carry the refs, and a ref whose image never lands
+ * is defined as equivalent to a placeholder for training joins.
+ */
+export function createProduceCollectedImagesStep<
+    T extends {
+        team?: { teamId: number }
+        headers?: { session_id: string }
+        collectedImages?: CollectedImage[]
+        message: { timestamp?: number }
+    },
+>(
+    outputs: IngestionOutputs<MlImageScrubOutput>,
+    producedRefCacheMax: number = PRODUCED_REF_CACHE_MAX,
+    privacy?: MlPrivacyBatchController
+): ProcessingStep<T, T> {
+    const producedRefs = new RefDedupCache('image_scrub_producer', producedRefCacheMax)
+
+    return function produceCollectedImagesStep(input) {
+        const sessionId = input.headers?.session_id
+        const key =
+            sessionId && usesRawSessionIdentifiers(sessionId) && input.team
+                ? privacy?.keys(input.team.teamId, sessionId)?.session
+                : undefined
+        const images = input.collectedImages
+        if (!images?.length) {
+            return Promise.resolve(ok(input))
+        }
+
+        const cacheRef = (ref: string): string => (key ? `${key.identity.sessionId}:${ref}` : ref)
+        const fresh = images.filter((image) => !producedRefs.has(cacheRef(image.ref)))
+        MlMirrorMetrics.incrementMlImagesCollected('deduped', images.length - fresh.length)
+        if (fresh.length === 0) {
+            return Promise.resolve(ok({ ...input, collectedImages: undefined }))
+        }
+
+        let bytes = 0
+        for (const image of fresh) {
+            producedRefs.add(cacheRef(image.ref))
+            bytes += image.bytes.length
+        }
+        MlMirrorMetrics.incrementMlImagesCollected('queued', fresh.length)
+        const captureTimestampMs = input.message.timestamp
+        const headers =
+            captureTimestampMs !== undefined && Number.isSafeInteger(captureTimestampMs) && captureTimestampMs > 0
+                ? { [CAPTURE_TIMESTAMP_HEADER]: String(captureTimestampMs) }
+                : undefined
+
+        // The ack handlers must capture only the refs: `image.bytes` are subarray views into the
+        // whole packed FFI buffer (up to 32 MB per source message), and queueMessages copies the
+        // slices synchronously — a closure holding `fresh` would pin the full packed buffer per
+        // in-flight produce, unbounded by the producer queue's byte accounting.
+        const refs = fresh.map((image) => cacheRef(image.ref))
+        const produce = outputs
+            .queueMessages(
+                ML_IMAGE_SCRUB_OUTPUT,
+                fresh.map((image) => {
+                    validateImageOwner(image.ref, key)
+                    const encrypted = encryptedKafkaValue(key, 'image-source', image.bytes, image.ref)
+                    return { key: image.ref, value: encrypted.value, headers: { ...headers, ...encrypted.headers } }
+                })
+            )
+            .then(() => {
+                // queueMessages resolves on delivery acks, so `produced` counts what actually landed.
+                MlMirrorMetrics.incrementMlImagesCollected('produced', refs.length)
+                MlMirrorMetrics.incrementMlProducedVersion('image', mlWireVersion(key), refs.length)
+                MlMirrorMetrics.incrementMlImageBytesProduced(bytes)
+            })
+            .catch((error) => {
+                // A dangling ref reads as a placeholder downstream, so a failed produce is logged,
+                // never re-thrown into the pipeline. Un-mark the refs: the same image recurring in
+                // a later snapshot then re-produces naturally (one attempt per recurrence, no retry
+                // loop), and duplicates are idempotent downstream (S3 keyed by hash).
+                for (const ref of refs) {
+                    producedRefs.delete(ref)
+                }
+                logger.warn('🖼️', 'ml_image_scrub_produce_failed', { count: refs.length, error: String(error) })
+                MlMirrorMetrics.incrementMlImagesCollected('produce_failed', refs.length)
+                if (key) {
+                    throw error
+                }
+            })
+        return Promise.resolve(ok({ ...input, collectedImages: undefined }, [produce]))
+    }
+}

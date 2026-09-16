@@ -1,0 +1,554 @@
+---
+title: Implementing MCP tools
+sidebar: Docs
+showTitle: true
+---
+
+MCP tools are atomic capabilities – CRUD operations and simple actions that agents compose into workflows.
+Every product should be accessible through the MCP server.
+Tools answer "what can I do?" (list feature flags, execute SQL, create a survey).
+
+For teaching agents _how_ to use these capabilities in combination,
+see [Writing skills](/handbook/engineering/ai/writing-skills).
+
+## TL;DR
+
+```sh
+# 1. Scaffold a starter YAML with all operations disabled
+pnpm --filter=@posthog/mcp run scaffold-yaml -- --product your_product \
+    --output ../../products/your_product/mcp/tools.yaml
+
+# 2. Configure the YAML – enable tools, add scopes, annotations, descriptions
+#    Place in products/<product>/mcp/*.yaml (preferred, e.g. actions, cohorts)
+
+# 3. For read/list tools backed by PostHog database rows, add a HogQL system table
+#    in posthog/hogql/database/schema/system.py and a model reference in
+#    products/posthog_ai/skills/querying-posthog-data/references/
+
+# 4. Generate handlers and schemas
+hogli build:openapi
+
+# 5. Merge to master – CI builds and distributes automatically
+```
+
+## Tool design principles
+
+MCP tools should be **basic capabilities** – atomic CRUD operations and simple actions.
+Agents compose these primitives into higher-level workflows.
+
+**Good tools**:
+
+- List feature flags
+- Get an experiment by ID
+- Create a survey
+- Summarize a session recording
+
+**Bad tools**:
+
+- "Search for session recordings of an experiment" – this bundles multiple concerns.
+  Instead, expose four composable tools:
+  list experiments, get experiment, search session recordings, summarize sessions.
+
+The reasoning: agents are better at composing simple tools than navigating complex ones,
+and simple tools are reusable across many workflows.
+
+## Two MCP server versions
+
+Clients must support two main capabilities: MCPs and skills.
+MCP support is widespread; however, skills support is still very early
+and mostly coding agents support them.
+To mitigate this, the MCP server ships two versions controlled via the
+`x-posthog-mcp-version: <version_number>` header.
+
+### Legacy MCP (v1)
+
+For clients that don't support skills.
+Exposes the full set of CRUD tools with simple instructions (list, read, create, update, delete).
+
+Primarily oriented toward vibe-coding web tools.
+
+### SQL-first MCP for clients supporting skills (v2)
+
+v2 instructs the agent to read data through a unified HogQL interface
+(list and get tools are generally excluded),
+which unlocks flexibility in data retrieval, search, and manipulation.
+Additionally, the consumer has access to a skill that provides schema references and example patterns,
+giving it richer context about PostHog's data model.
+
+Here, "SQL-first" describes entity retrieval, not a preference for every analytics task.
+Choose typed queries or SQL from the required calculation and output, as described in [query selection guidance](./writing-skills.md#query-selection-guidance).
+
+Primarily oriented toward coding agents (PostHog Desktop, PostHog AI, Claude Code).
+
+## Claude web and desktop exec schema budget
+
+Claude web and desktop silently drop a tool when its serialized `inputSchema` reaches 16,384 characters, so the final `exec` input schema has a test budget below that limit.
+Keep only guidance needed on nearly every call inline, including the compact tool-domain index.
+Everything else belongs in the `learn` catalog: Claude web and desktop guides, and, behind the `mcp-exec-skills` flag, PostHog and project skills.
+Skill names, descriptions, and bodies never go into the tool schema; agents discover them with `learn -s "<query>"` and read them with `learn <source>:<skill> [path]`.
+Project skill search applies the caller's per-skill read permissions before ranking and limiting results; restricted skills contribute no metadata or excerpts.
+The search endpoint uses dedicated burst and sustained budgets at the standard API rates (480 requests/minute and 4,800/hour). Personal API keys have separate budgets; OAuth and browser sessions share a budget per user. Exceeding either budget returns HTTP 429 with `Retry-After`, before the search runs.
+The project skill API defaults to 8,000-character body pages. For `learn`, MCP requests up to 1,000,000 characters in one call, covering the API's 1 MB UTF-8 body limit, and rejects oversized or incomplete bodies before searching or formatting them. The separate 44,000-character display budget directs agents to search or read line ranges for larger files.
+
+File reads and scoped searches scan lines incrementally. Search stops after 50 matches or when the display budget is full, preserving two context lines on either side where they fit. Heading outlines are bounded while being built, and oversized line ranges fail with a request to narrow the range. Files with many short lines do not require an array containing every line.
+Do not trim endpoint serializers or generated tool schemas to meet the budget; they stay the source of truth for `info` and `schema`.
+
+The eval runner's `--skill-delivery exec` mode removes bundled skills and defaults cases without an explicit interaction origin to the `eval` MCP consumer, which supports skill `learn`. Explicit case origins take precedence in both delivery modes. Bundled mode leaves unspecified origins unchanged.
+The runner applies the selected delivery mode to both Python's sandbox-provisioning flag override and MCP's flag override. Bundled mode preserves native skills unless a case explicitly disables them; exec mode removes them. Compare the `expected_skill_loaded` and `skill_loaded_before_tool` scores: a completed eval run can report `PASS` despite zero scores unless `--fail-under` sets a score threshold.
+Bundled-mode evals explicitly disable `mcp-exec-skills` through the dev/test process override, which skips skill-catalog warmup and polling. Exec-mode evals allow 120 seconds for MCP startup, covering the 60-second warmup budget plus an in-flight download and development build; bundled mode keeps the 30-second startup limit. Production feature-flag evaluation does not control this process lifecycle.
+
+## Rolling out MCP skill discovery
+
+Deploy the Django skills API, task launcher, and MCP changes before enabling `mcp-exec-skills`.
+Create or reuse a boolean flag with that exact key in the analytics project used by the two services; start disabled and enable a narrow user or organization condition first.
+A missing flag evaluates as off. Development `FEATURE_FLAG_OVERRIDES` do not enable production behavior.
+
+Verify the published skills archive loads, then start a new MCP session and sandbox task for an enabled user.
+Exercise `learn -s`, a qualified skill read, and a product call, and check that a disabled user retains the prior behavior.
+The `plugin` and `posthog-code` consumers remain excluded regardless of the flag.
+Monitor archive validation errors, catalog size, MCP memory, and task failures before expanding the release condition.
+
+To roll back access, disable the flag and start fresh sessions/tasks. This does not restore skills already removed from an existing sandbox.
+Background cache behavior during rollback is described below.
+
+## Shared skill archive cache
+
+Each MCP process holds a parsed catalog in memory. Redis stores immutable archive bytes under a SHA-256 key and one JSON pointer containing the current SHA, ETag, and last successful upstream validation time. Writers store the bytes before replacing the pointer; readers fetch the named blob and verify its hash before using it. Polling an unchanged version never transfers the archive bytes.
+
+For rollout and rollback, disabling `mcp-exec-skills` blocks caller access to product and project skills but does not unload the production catalog or stop archive polling. Stopping background catalog work requires a deployment change; restarting the same deployment reloads the catalog. The dev/test override described above does not apply in production.
+
+The `v2` keys are separate from the earlier split-key layout, so a rolling deploy starts a new cache without changing the old processes' data. A failed write leaves the previous generation readable. Missing blobs trigger a full download; a 304 refresh extends the referenced blob's TTL and updates the pointer only if that pointer is still current. Old archive generations expire after the 30-day archive TTL. The context-mill slim manifest uses the same helper with its own namespace and seven-day TTL; its resource bodies remain keyed by URI.
+
+The shared archive is checked for upstream changes after ten minutes. Use `mcp_skill_archive_last_validated_timestamp_seconds` to detect validation outages, including across process restarts. A successful 304 advances this timestamp. `mcp_skill_catalog_age_seconds` instead measures time since parsing and can grow while an unchanged archive remains healthy.
+
+A candidate alert expression is `time() - mcp_skill_archive_last_validated_timestamp_seconds > 1800`, sustained for five minutes. Zero means the process has not observed a successful shared validation. Pair this with `mcp_skill_archive_events_total{result="error"}` and `mcp_skill_catalog_skills` when investigating. This metric does not prove that each process has adopted the latest archive. The alert must be configured in the monitoring system; exposing the metric does not send notifications.
+
+## SQL-first MCP: HogQL system tables
+
+Most list/get endpoints exposed as MCP tools should have a corresponding HogQL system table.
+This lets agents query PostHog data via SQL in addition to (or instead of) the REST API tools.
+
+Exceptions are OK when the tool intentionally proxies service-owned data,
+aggregates data that is not represented as a team-scoped PostHog table,
+or returns a curated API shape that would be awkward or unsafe to rebuild in SQL.
+For these tools, keep the surface narrow and document the source and shape in the YAML description.
+
+For proxy endpoints that can fail because of either user permissions or request scope,
+return distinct API-visible error details. Agents should stop on true authorization
+failures, but they can often recover from a bad project/team filter if the response says
+the requested scope is unavailable.
+
+System tables are defined in [`posthog/hogql/database/schema/system.py`](https://github.com/PostHog/posthog/blob/master/posthog/hogql/database/schema/system.py) as `PostgresTable` instances.
+Each table must include a `team_id` column for data isolation.
+
+Use `mcp_version: 1/2` to control availability of retrieval tools in v2 of the MCP.
+
+Example from the codebase:
+
+```python
+feature_flags: PostgresTable = PostgresTable(
+    name="feature_flags",
+    postgres_table_name="posthog_featureflag",
+    fields={
+        "id": IntegerDatabaseField(name="id"),
+        "team_id": IntegerDatabaseField(name="team_id"),
+        # ...
+    },
+)
+```
+
+Agents query these tables with the `system.` prefix:
+
+```sql
+SELECT id, key, name FROM system.feature_flags WHERE active = 1 LIMIT 10
+```
+
+### Extending query examples
+
+When you add a new system table,
+also add a model reference file to [`products/posthog_ai/skills/querying-posthog-data/references/`](https://github.com/PostHog/posthog/tree/master/products/posthog_ai/skills/querying-posthog-data/references).
+The naming convention is `models-<domain>.md`.
+
+Existing references:
+
+- `models-actions.md`
+- `models-cohorts.md`
+- `models-dashboards-insights.md`
+- `models-data-warehouse.md`
+- `models-error-tracking.md`
+- `models-flags-experiments.md`
+- `models-groups.md`
+- `models-notebooks.md`
+- `models-surveys.md`
+- `models-variables.md`
+
+Each file documents the table's columns, types, nullability, and notable structures (like JSON fields).
+See [`models-flags-experiments.md`](https://github.com/PostHog/posthog/blob/master/products/posthog_ai/skills/querying-posthog-data/references/models-flags-experiments.md) for a good example.
+Register your new reference in [`products/posthog_ai/skills/querying-posthog-data/SKILL.md`](https://github.com/PostHog/posthog/blob/master/products/posthog_ai/skills/querying-posthog-data/SKILL.md) under **Data Schema**.
+
+## Code generation pipeline
+
+The pipeline turns Django serializers into MCP tool handlers via OpenAPI.
+Run the full pipeline with:
+
+```sh
+hogli build:openapi
+```
+
+### Pipeline steps
+
+```text
+build:openapi-schema     Django → OpenAPI JSON (frontend/tmp/openapi.json)
+        │
+        ▼
+build:openapi-types      OpenAPI → TypeScript API types (frontend)
+        │
+        ▼
+build:openapi-mcp        OpenAPI → Zod schemas for MCP (Orval)
+        │
+        ▼
+build:openapi-mcp-tools  YAML definitions + Zod schemas → TypeScript tool handlers
+```
+
+### YAML definitions
+
+YAML definitions are the configuration layer.
+They live in **`products/<product>/mcp/*.yaml`**, keeping config close to the owning product's code.
+
+> **Fallback path:** `services/mcp/definitions/*.yaml` is available for functionality that doesn't have a product folder.
+> When a product folder exists, always place definitions there.
+
+The build pipeline discovers YAML files from both paths.
+Product teams own their definitions and control which operations are exposed as MCP tools.
+
+**Workflow: scaffold, configure, generate.**
+
+1. **Scaffold** a starter YAML with all operations disabled.
+   `--product` discovers endpoints by their **`x-product`** attribution —
+   it matches endpoints whose product attribution equals the product name.
+   ViewSets in `products/<name>/backend/` are auto-attributed via the module path.
+   ViewSets elsewhere (e.g. `posthog/api/`, `ee/`) need
+   `@extend_schema(extensions={"x-product": "<product>"})`.
+   There is deliberately no URL-based matching — paths are a lossy signal of
+   ownership and used to pull endpoints into the wrong product's tool list.
+
+   The same applies when your product's API routes use a different slug than
+   the product folder name (e.g. `workflows` product with `/hog_flows/` routes):
+   add `@extend_schema(extensions={"x-product": "workflows"})` to the ViewSet so
+   the scaffold can find them.
+
+   ```sh
+   pnpm --filter=@posthog/mcp run scaffold-yaml -- --product your_product
+   # or output directly into a product folder:
+   pnpm --filter=@posthog/mcp run scaffold-yaml -- --product your_product \
+       --output ../../products/your_product/mcp/tools.yaml
+   ```
+
+2. **Configure** the YAML – enable tools, add scopes, annotations, and descriptions.
+   Each YAML file has a top-level structure validated by Zod ([`scripts/yaml-config-schema.ts`](https://github.com/PostHog/posthog/blob/master/services/mcp/scripts/yaml-config-schema.ts)):
+
+   **Tool names** follow a **`domain-action`** convention in lowercase kebab-case (`[a-z0-9-]`),
+   e.g. `feature-flags-list`, `experiments-create`, `surveys-delete`.
+   The domain groups related tools together and the action describes the operation.
+   Names must not start or end with a hyphen.
+
+   **Feature identifiers** must be lowercase snake*case (`[a-z0-9*]`), e.g. `error_tracking`,
+`feature_flags`. They should match the product folder name.
+
+   **Tool name length limit:** tool names must be **52 characters or fewer**.
+   This limit exists because MCP clients enforce different combined limits on server+tool name:
+
+   | Client           | Limit                          | Notes                                                                 |
+   | ---------------- | ------------------------------ | --------------------------------------------------------------------- |
+   | MCP spec (draft) | 1–128 chars, `[A-Za-z0-9_\-.]` | Recommendation, not hard-enforced                                     |
+   | Claude Code      | 64 chars                       | Prefixes tool names with `mcp____`                                    |
+   | Cursor           | 60 chars combined              | `server_name + tool_name`; tools exceeding this are silently filtered |
+   | OpenAI API       | `^[a-zA-Z0-9_-]+$`, 64 chars   | No dots allowed                                                       |
+
+   With the server name "posthog" (7 chars) plus a separator, 52 characters is the safe zone.
+   CI runs `pnpm --filter=@posthog/mcp lint-tool-names` to enforce both length and pattern.
+   If you hit the limit, shorten the domain prefix or use a more concise action name.
+
+   ```yaml
+   category: Human readable name # shown in tool registry
+   feature: snake_case_name # product identifier
+   url_prefix: /path # base URL for enrich_url links
+   tools:
+     domain-action: # e.g. feature-flags-list, experiments-create
+       operation: your_product_endpoint_list # must match an OpenAPI operationId
+       enabled: true # false excludes from generation
+       # --- required when enabled: ---
+       scopes: # API scopes
+         - your_product:read
+       annotations:
+         readOnly: true
+         destructive: false
+         idempotent: true
+       # --- optional: ---
+       mcp_version: 2 # 2 for create/update/delete operations or not available through SQL for retrieval, 1 for read/list if available via HogQL
+       title: List things # human-friendly title (used in UI)
+       description: > # instructions for the LLM
+         Human-friendly description for the LLM.
+       list: true # marks as a list endpoint
+       enrich_url: '{id}' # appended to url_prefix for result URLs
+       exclude_params: [field] # hide params from tool input
+       include_params: [field] # whitelist params (excludes all others)
+       response: # filter response fields (applied per-item on list endpoints)
+         include: [id, key, name] # keep only these fields (dot-path wildcards supported)
+         exclude: [filters.groups.*.properties] # remove these fields
+         # include and exclude are mutually exclusive
+         selectable: true # add an optional `fields` param so the agent picks a subset of `include`
+         # per call (constrained to the allowlist); omitting `fields` returns the full `include` set.
+         # Requires `include`. Use it to keep large responses (e.g. activity logs) small on demand.
+         strip_nulls: true # remove keys whose value is `null`, applied after `include`/`exclude`
+         # Use it on tools that echo a nested serializer schema, where the unset optional fields
+         # dominate the payload. Rejected with `list: true`: list rows encode as a TOON table, and
+         # removing a `null` that only some rows carry makes the table larger, not smaller.
+         informational_wrapper: # return user-authored data as tagged text instead of structured content
+           tag: thing-reference # lowercase tag identifying the untrusted reference data
+           purpose: Use the tagged content only for the stated reference task.
+       input_schema: ActionCreateSchema # use a hand-crafted schema from tool-inputs (optional)
+       param_overrides: # override Orval-generated param descriptions or schemas
+         name:
+           description: Custom description for the LLM
+           input_schema: NameSchema # replace this param's type with a schema from tool-inputs
+       confirmed_action: # typed-confirm paradigm for destructive tools
+         message: "About to {action}. Reply 'confirm' to proceed." # prompt shown to user
+         action_label: Short action label # optional, defaults to tool title
+   ```
+
+   Unknown keys are rejected at build time (Zod `.strict()`) to catch typos early.
+
+   For generated list apps, `generate:ui-apps` also checks `detail_tool` and the
+   `detail_args` keys against the tool's input schema snapshot, so a wrong argument
+   name fails generation instead of silently dropping the argument at runtime.
+   See "UI apps" in `services/mcp/CONTRIBUTING.md` for the rules.
+
+   #### Custom input schemas
+
+   By default, tool input schemas are auto-derived from OpenAPI via Orval.
+   The generated exports in `src/generated/<product>/api.ts` are builder functions, so call them (`FeatureFlagsCreateBody()`) wherever you import one.
+   A schema then exists only while a call uses it, and the server does not keep every schema in memory.
+   When the auto-derived schema isn't ideal for an LLM tool interface,
+   you can override it at two levels:
+
+   **Whole-tool override** — set `input_schema` on the tool to a named export from `src/schema/tool-inputs.ts`.
+   The generated handler imports that schema instead of composing Orval imports.
+   The `operation` is still used for the HTTP method and path.
+   Path parameters are extracted from the URL pattern;
+   remaining parameters are forwarded as body (POST/PATCH/PUT) or query (GET/DELETE).
+
+   **Per-param override** — set `input_schema` inside `param_overrides` to replace a single field's Zod type
+   while keeping the rest of the Orval-derived schema.
+   The generated code uses `.extend()` to replace just that field.
+   See [supported annotations](https://modelcontextprotocol.io/specification/2025-06-18/schema#toolannotations) for the full list.
+
+   #### Hand-written override of a generated tool
+
+   The two overrides above reshape a generated tool's schema.
+   Neither can change what happens before the request goes out.
+   `validators` runs as a synchronous `superRefine`, so it cannot await anything;
+   `inject_body` supplies static values; `rename_params` only renames.
+
+   When a tool has to read current state before writing, export a hand-written tool under the generated tool's own name.
+   `mergeToolFactories` gives hand-written entries precedence on a name collision, so the hand-written tool replaces the generated one everywhere:
+   the Hono catalog, the CLI, `getToolsFromContext`, and `posthog-connection-call`.
+
+   `src/tools/featureFlags/updateFeatureFlag.ts` is the reference.
+   It spreads the generated tool so the name, schema and any field codegen adds later carry over, replaces only the handler, and delegates back to the generated handler to make the request:
+
+   ```ts
+   const generated = GENERATED_TOOLS['update-feature-flag']!()
+
+   return {
+     ...generated,
+     handler: async (context, params) => {
+       const existing = await context.api.request({ method: 'GET', path: `...` })
+       return generated.handler(context, { ...params, filters: merge(existing, params.filters) })
+     },
+   }
+   ```
+
+   Reach for this only when a read-modify-write is genuinely needed.
+   Every override is a name collision that has to stay deliberate, which `tests/unit/tool-name-validation.test.ts` enforces by pinning the set of shadowed names.
+   If a second tool needs the same treatment, add support for a `before_request:` hook to the YAML config instead of a second shadow.
+
+   #### Typed-confirm paradigm for destructive tools
+
+   For destructive or security-sensitive tools (account changes, key revocation, bulk deletes),
+   declare `confirmed_action` in the YAML config. The codegen emits two tools instead of one:
+   - `<name>-prepare` – validates the arguments and returns a signed `confirmation_hash` plus a message for the user.
+   - `<name>-execute` – accepts only the hash and the literal word "confirm" typed by the user, then performs the signed action.
+
+   The model calls them in sequence: prepare → surface the message to the user → wait for "confirm" → execute.
+
+   ```yaml
+   tools:
+     org-delete:
+       operation: organizations_destroy
+       enabled: true
+       scopes: [organization_admin:write]
+       annotations:
+         readOnly: false
+         destructive: true
+         idempotent: false
+       confirmed_action:
+         message: "About to delete organization {orgId}. Reply 'confirm' to proceed."
+         action_label: Delete organization
+   ```
+
+   **Fields:**
+   - `message` (required) – prompt text shown to the user. Supports `{paramName}` placeholders interpolated from the validated tool args at runtime.
+   - `action_label` (optional) – short human-readable label for the action (e.g. "delete project"). Surfaced in refusal messages. Defaults to the tool's title.
+
+   **Security model:** the prepare step stashes the validated args and the active project/organization scope in Redis, and signs their SHA-256 digest together with the user identity, tool purpose, a TTL, and a single-use nonce into an HMAC-SHA256 token. The token stays small and constant-size no matter how large the args are, because the model relays only a reference to the payload. The execute step has a strict confirmation-only schema, verifies the signature, fetches-and-burns the stashed payload (the burn is the single-use enforcement), checks it against the signed digest, re-checks that the active scope still matches the one bound at prepare time, and only then runs the original handler with the verified payload. Action args belong only on prepare; extra execute-time fields are rejected, and a confirmation prepared while one project was active can't be replayed against another after `switch-project`.
+
+   The confirmation word is supplied through model-authored tool arguments. This is an instruction-backed workflow guard, not client-attested proof that the human typed the word. API scopes remain the authorization boundary.
+
+   **Constraints:**
+   - Cannot combine `confirmed_action` with `input_schema` – custom input schemas do not use the confirmed-action codegen path yet.
+   - Cannot combine `confirmed_action` with `ui_app` – the codegen doesn't wrap the execute factory with `withUiApp` yet.
+   - Requires the `MCP_SIGNED_STATE_KEY` environment variable (≥32 bytes) on every environment running the MCP Hono server. A missing or short key disables the paradigm at boot (non-`confirmed_action` tools keep working), and `-prepare`/`-execute` calls fail at request time with a message pointing at the env var.
+
+3. **Generate** handlers and schemas:
+
+   ```sh
+   hogli build:openapi
+   ```
+
+### Keeping definitions in sync
+
+When backend API endpoints change, sync the YAML definitions:
+
+```sh
+pnpm --filter=@posthog/mcp run scaffold-yaml -- --sync-all
+```
+
+This is idempotent and non-destructive –
+it only adds newly discovered operations (with `enabled: false`) and removes stale ones.
+All hand-authored configuration is preserved.
+CI runs this as a drift check.
+
+See [`services/mcp/definitions/README.md`](https://github.com/PostHog/posthog/blob/master/services/mcp/definitions/README.md) for the full YAML schema reference (note: YAML definitions themselves now live in product folders)
+and [`services/mcp/scripts/yaml-config-schema.ts`](https://github.com/PostHog/posthog/blob/master/services/mcp/scripts/yaml-config-schema.ts) for the Zod validation source.
+
+## Testing
+
+See [How to develop and test](/handbook/engineering/ai/implementation#how-to-develop-and-test)
+for instructions on running the MCP server locally and verifying tools end-to-end.
+
+### Structured data for native tool widgets
+
+For the `posthog_ai` consumer, tool responses carry the handler's returned data in
+`_meta["com.posthog.mcp/app_data"]`, including tools without an MCP UI resource.
+This applies to direct calls and calls through `exec`. The metadata excludes the
+internal formatted-results override. The model receives the formatted text in `content`;
+an explicit JSON output request still controls that text independently of widget data.
+These responses omit the duplicate `structuredContent`. MCP tool spans exclude the
+app-data metadata for this consumer while retaining model-visible output.
+
+The agent forwards the MCP result through ACP's `rawOutput`. Claude and Codex adapters
+preserve its metadata in live updates and history. When rebuilding a Claude model
+transcript from ACP logs, the agent removes MCP result metadata before applying the
+resume context budget. Metadata is available to widgets without becoming model input.
+If widget metadata makes a task event exceed the transport size limit, the agent
+removes that metadata and retries the size check. Text and status still reach the
+client when the remaining event fits; events that remain oversized are dropped.
+
+Native widgets read app data, existing `structuredContent`, or a direct result object.
+They never decode TOON or JSON from result text.
+The `execute-sql` backend returns the executed query in `structured_content` alongside its formatted text.
+The MCP handler forwards that query as widget metadata, preserving resolved saved-variable definitions, `connectionId`, and `sendRawQuery`.
+The widget renders it through the shared Query component in a `DataVisualizationNode`.
+The Query component fetches the results for this visualization.
+All query widgets require the executed query from the tool result. Old transcripts containing only text show the generic tool card.
+Failed calls and missing or malformed widget data also use that fallback.
+The web client resolves tool identity from ACP `_meta.posthog`, with legacy
+`_meta.claudeCode` support. Non-exec MCP tools retain their qualified metadata names
+to avoid collisions with built-in renderers. It retains `rawOutput` from both live updates and completed
+`tool_call` frames in history.
+
+Deploy MCP and agent transport support before deploying a frontend that requires
+structured widget data. Verify both live calls and history replay, and inspect the
+next model request to confirm that app metadata is absent.
+
+## Serializer best practices
+
+Descriptions flow through the entire pipeline:
+
+```text
+Django serializer field → OpenAPI spec → Zod schema → MCP tool description
+```
+
+Product teams should **type and describe** their serializer fields.
+These descriptions are what agents read to understand tool parameters –
+vague or missing descriptions lead to worse agent behavior.
+
+See the [type system guide](/handbook/engineering/type-system) for the full backend → frontend pipeline,
+including how to set up viewsets, serializers, and `@extend_schema` correctly.
+For a comprehensive audit checklist, before/after examples, and detailed serializer/viewset patterns,
+see the [`improving-drf-endpoints` skill](https://github.com/PostHog/posthog/blob/master/.agents/skills/improving-drf-endpoints/SKILL.md).
+
+**Tips:**
+
+- Use `help_text` on serializer fields – it becomes the OpenAPI description.
+  Be careful when using imperative language in `help_text`,
+  as the same annotations are used in the API docs.
+- Use `param_overrides` in YAML definitions to override Orval-generated descriptions.
+  This is useful when you want to add imperative instructions for specific fields.
+- Be specific about formats, constraints, and valid values.
+- Avoid jargon that an LLM wouldn't understand without context.
+- `ListField` and `JSONField` need explicit types —
+  use `ListField(child=serializers.CharField())` instead of bare `ListField()`,
+  and `@extend_schema_field(PydanticModel)` on `JSONField` subclasses
+  (see `posthog/api/alert.py` for the pattern).
+  Without this, Orval generates `z.unknown()`.
+- Plain `ViewSet` methods that validate manually need `@extend_schema(request=YourSerializer)` —
+  without it, drf-spectacular can't discover the request body
+  and the generated tool gets an empty schema with zero parameters.
+  `ModelViewSet` with `serializer_class` works automatically.
+
+### Defaults in partially updated settings
+
+For JSON settings that merge on PATCH, leave nested `default` values out of the shared request schema.
+Orval turns them into Zod defaults, so MCP sends values the caller omitted and overwrites stored settings.
+For example, evaluation updates must preserve `allows_na` when the caller changes only `true_is_failure`, and vice versa.
+Apply creation defaults in backend validation and describe them in the field's help text.
+
+### Root-router viewsets
+
+Viewsets mounted at root URLs (no `team_id`/`project_id` in the path) set
+`param_derived_from_user_current_team` and are excluded from the OpenAPI schema by default,
+which means they are invisible to frontend type generation and MCP tool scaffolding.
+If your viewset is one of these and you want to expose it,
+set `force_include_in_api_docs = True` on the class. See `ee/api/billing.py` for an example.
+This flag only controls schema inclusion.
+Runtime access still comes from the viewset's `scope_object`,
+`scope_object_read_actions`, `scope_object_write_actions`,
+and any per-action `required_scopes` or `dangerously_get_required_scopes` overrides.
+Only mark the actions you actually want PATs, OAuth tokens, and MCP clients to call.
+
+## HogQL query schemas (WIP)
+
+[`frontend/src/queries/schema/schema-assistant-queries.ts`](https://github.com/PostHog/posthog/blob/master/frontend/src/queries/schema/schema-assistant-queries.ts) defines structured query types
+for the AI assistant (trends, funnels, retention, etc.).
+
+These schemas describe the shape of analytical queries with rich JSDoc comments
+that help agents generate correct HogQL.
+The cleaner and better-described these schemas are,
+the better agents perform at query generation.
+
+This is a work in progress –
+the goal is to make it easier to generate HogQL queries from typed schemas
+than from freeform SQL.
+A `schema.json` integration into the codegen pipeline is planned.
+
+## Agent skills that support the MCP server
+
+- **`querying-posthog-data`** – HogQL query patterns, system model schemas, and available functions.
+  Extend this skill to explain how agents should use your HogQL-exposed tables and queries.
+  See [`products/posthog_ai/skills/querying-posthog-data/SKILL.md`](https://github.com/PostHog/posthog/blob/master/products/posthog_ai/skills/querying-posthog-data/SKILL.md).
+- **`improving-drf-endpoints`** – Audit checklist and patterns for DRF serializers and viewsets.
+  Use when editing or reviewing endpoints to ensure `help_text`, field types, and `@extend_schema` annotations
+  flow correctly through the type pipeline.
+  See [`.agents/skills/improving-drf-endpoints/SKILL.md`](https://github.com/PostHog/posthog/blob/master/.agents/skills/improving-drf-endpoints/SKILL.md).

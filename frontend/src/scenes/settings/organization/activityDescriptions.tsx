@@ -1,0 +1,343 @@
+import {
+    ActivityLogItem,
+    ActivityLogUserName,
+    HumanizedChange,
+    defaultDescriber,
+} from 'lib/components/ActivityLog/humanizeActivity'
+import { UserNameWithEmail } from 'lib/components/ActivityLog/UserNameWithEmail'
+import { OrganizationMembershipLevel } from 'lib/constants'
+import { Link } from 'lib/lemon-ui/Link'
+import { membershipLevelToName } from 'lib/utils/permissioning'
+import { urls } from 'scenes/urls'
+
+const nameOrLinkToOrganization = (name?: string | null): string | JSX.Element => {
+    let displayName = name || 'Organization'
+
+    if (displayName.length > 32) {
+        displayName = displayName.slice(0, 32) + '...'
+    }
+
+    return <Link to={urls.settings('organization')}>{displayName}</Link>
+}
+
+export function organizationActivityDescriber(logItem: ActivityLogItem, asNotification?: boolean): HumanizedChange {
+    if (logItem.scope === 'OrganizationMembership') {
+        return organizationMembershipActivityDescriber(logItem, asNotification)
+    }
+    if (logItem.scope === 'OrganizationInvite') {
+        return organizationInviteActivityDescriber(logItem, asNotification)
+    }
+    if (logItem.activity == 'created') {
+        return {
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> created the organization{' '}
+                    <strong>{nameOrLinkToOrganization(logItem?.detail.name)}</strong>
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'deleted') {
+        return {
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> deleted the organization{' '}
+                    <strong>{logItem.detail.name || 'Organization'}</strong>
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'updated') {
+        const changes = logItem.detail.changes || []
+
+        if (changes.length === 1) {
+            const change = changes[0]
+            const changeDescription = (
+                <>
+                    updated the <strong>{change.field}</strong>
+                </>
+            )
+
+            return {
+                description: (
+                    <>
+                        <ActivityLogUserName logItem={logItem} /> {changeDescription} for organization{' '}
+                        {nameOrLinkToOrganization(logItem?.detail.name)}
+                    </>
+                ),
+            }
+        } else if (changes.length > 1) {
+            return {
+                description: (
+                    <>
+                        <ActivityLogUserName logItem={logItem} /> updated <strong>{changes.length} settings</strong> for
+                        organization {nameOrLinkToOrganization(logItem?.detail.name)}
+                    </>
+                ),
+            }
+        }
+    }
+
+    return defaultDescriber(logItem, asNotification, nameOrLinkToOrganization(logItem?.detail.name))
+}
+
+function organizationMembershipActivityDescriber(logItem: ActivityLogItem, asNotification?: boolean): HumanizedChange {
+    const context = logItem?.detail?.context
+    const userEmail = context?.user_email || ''
+    const userName = context?.user_name || userEmail
+    const organizationName = context?.organization_name || 'the organization'
+
+    if (logItem.activity == 'created') {
+        return {
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> added user{' '}
+                    <strong>
+                        {userName} ({userEmail})
+                    </strong>{' '}
+                    to organization{nameOrLinkToOrganization(organizationName)}
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'deleted') {
+        return {
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> removed user{' '}
+                    <strong>
+                        {userName} ({userEmail})
+                    </strong>{' '}
+                    from organization {nameOrLinkToOrganization(organizationName)}
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'updated') {
+        const changes = logItem.detail.changes || []
+        const levelChange = changes.find((c) => c.field === 'level')
+
+        if (levelChange) {
+            const beforeLevel =
+                membershipLevelToName.get(levelChange.before as OrganizationMembershipLevel) || levelChange.before
+            const afterLevel =
+                membershipLevelToName.get(levelChange.after as OrganizationMembershipLevel) || levelChange.after
+
+            return {
+                description: (
+                    <>
+                        <ActivityLogUserName logItem={logItem} /> changed{' '}
+                        <strong>
+                            {userName} ({userEmail})
+                        </strong>
+                        's role from <strong>{String(beforeLevel)}</strong> to <strong>{String(afterLevel)}</strong> in
+                        organization {nameOrLinkToOrganization(organizationName)}
+                    </>
+                ),
+            }
+        }
+
+        return {
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> updated{' '}
+                    <strong>
+                        {userName} ({userEmail})
+                    </strong>
+                    's membership in organization {nameOrLinkToOrganization(organizationName)}
+                </>
+            ),
+        }
+    }
+
+    return defaultDescriber(logItem, asNotification)
+}
+
+function organizationInviteActivityDescriber(logItem: ActivityLogItem, asNotification?: boolean): HumanizedChange {
+    const context = logItem?.detail?.context
+    const targetEmail = context?.target_email || ''
+    const organizationName = context?.organization_name || 'the organization'
+    const level = context?.level || 'member'
+    // The context names whoever created the invite, who is not always the person who acted on this
+    // row, so the email must come from the same context as the name. A system or impersonated row
+    // hides it, as the actor's name and avatar do.
+    const inviterEmail = logItem.is_system || logItem.was_impersonated ? undefined : context?.inviter_user_email
+    const inviter = context?.inviter_user_name ? (
+        <UserNameWithEmail name={context.inviter_user_name} email={inviterEmail} />
+    ) : (
+        <ActivityLogUserName logItem={logItem} />
+    )
+
+    if (logItem.activity == 'created') {
+        return {
+            description: (
+                <>
+                    {inviter} sent an invitation to <strong>{targetEmail}</strong> to join organization{' '}
+                    {nameOrLinkToOrganization(organizationName)} as <strong>{level}</strong>
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'deleted') {
+        return {
+            description: (
+                <>
+                    {inviter} revoked the invitation for <strong>{targetEmail}</strong> to join organization{' '}
+                    {nameOrLinkToOrganization(organizationName)}
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'updated') {
+        const changes = logItem.detail.changes || []
+
+        if (changes.length === 1) {
+            const change = changes[0]
+            const changeDescription = (
+                <>
+                    updated <strong>{change.field}</strong>
+                </>
+            )
+
+            return {
+                description: (
+                    <>
+                        {inviter} {changeDescription} for the invitation sent to <strong>{targetEmail}</strong> to join
+                        organization {nameOrLinkToOrganization(organizationName)}
+                    </>
+                ),
+            }
+        } else if (changes.length > 1) {
+            return {
+                description: (
+                    <>
+                        {inviter} updated <strong>{changes.length} settings</strong> for the invitation sent to{' '}
+                        <strong>{targetEmail}</strong> to join organization {nameOrLinkToOrganization(organizationName)}
+                    </>
+                ),
+            }
+        }
+    }
+
+    return defaultDescriber(logItem, asNotification)
+}
+
+export function organizationDomainActivityDescriber(
+    logItem: ActivityLogItem,
+    asNotification?: boolean
+): HumanizedChange {
+    const context = logItem.detail.context
+    const domainName = context?.domain || 'unknown domain'
+
+    if (logItem.activity === 'updated') {
+        const changes = logItem.detail.changes || []
+        const hasScimEnabledChange = changes.some((c) => c.field === 'SCIM provisioning')
+
+        const descriptions: JSX.Element[] = []
+        for (const change of changes) {
+            if (change.field === 'SCIM provisioning') {
+                descriptions.push(
+                    <>
+                        {change.after ? 'enabled' : 'disabled'} <strong>SCIM provisioning</strong> for domain{' '}
+                        <strong>{domainName}</strong>
+                    </>
+                )
+            } else if (change.field === 'scim_bearer_token') {
+                if (!hasScimEnabledChange) {
+                    descriptions.push(
+                        <>
+                            rotated the <strong>SCIM bearer token</strong> for domain <strong>{domainName}</strong>
+                        </>
+                    )
+                }
+            } else {
+                descriptions.push(
+                    <>
+                        updated <strong>{change.field}</strong> for domain <strong>{domainName}</strong>
+                    </>
+                )
+            }
+        }
+
+        if (descriptions.length > 0) {
+            return {
+                description: (
+                    <>
+                        <ActivityLogUserName logItem={logItem} />{' '}
+                        {descriptions.length === 1 ? (
+                            descriptions[0]
+                        ) : (
+                            <ul>
+                                {descriptions.map((d, i) => (
+                                    <li key={i}>{d}</li>
+                                ))}
+                            </ul>
+                        )}
+                    </>
+                ),
+            }
+        }
+    }
+
+    if (logItem.activity === 'deleted') {
+        return {
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> deleted domain <strong>{domainName}</strong>
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity === 'created') {
+        return {
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> added domain <strong>{domainName}</strong>
+                </>
+            ),
+        }
+    }
+
+    return defaultDescriber(logItem, asNotification, domainName)
+}
+
+export function legalDocumentActivityDescriber(logItem: ActivityLogItem, asNotification?: boolean): HumanizedChange {
+    const detail = logItem.detail as {
+        name?: string | null
+        context?: { document_type?: string; company_name?: string }
+    }
+    const documentType = detail.context?.document_type || 'document'
+    const companyName = detail.context?.company_name || detail.name || 'company'
+    const article = documentType === 'BAA' || documentType === 'DPA' ? 'a' : 'the'
+
+    if (logItem.activity === 'created') {
+        return {
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> generated {article} <strong>{documentType}</strong> for{' '}
+                    <strong>{companyName}</strong>
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity === 'deleted') {
+        return {
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> deleted {article} <strong>{documentType}</strong> for{' '}
+                    <strong>{companyName}</strong>
+                </>
+            ),
+        }
+    }
+
+    return defaultDescriber(logItem, asNotification, `${documentType} for ${companyName}`)
+}

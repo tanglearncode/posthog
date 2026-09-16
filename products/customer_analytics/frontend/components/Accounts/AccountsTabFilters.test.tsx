@@ -1,0 +1,142 @@
+import '@testing-library/jest-dom'
+
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { BindLogic, Provider } from 'kea'
+
+import { userLogic } from 'scenes/userLogic'
+
+import { useMocks } from '~/mocks/jest'
+import { dataNodeLogic } from '~/queries/nodes/DataNode/dataNodeLogic'
+import { initKeaTests } from '~/test/init'
+import type { UserType } from '~/types'
+
+import type { ColumnConfigurationApi } from 'products/product_analytics/frontend/generated/api.schemas'
+
+import { ACCOUNTS_TABLE_DATA_NODE_KEY } from '../../constants'
+import { accountsLogic } from './accountsLogic'
+import { AccountsTabFilters } from './AccountsTabFilters'
+
+describe('AccountsTabFilters', () => {
+    let logic: ReturnType<typeof accountsLogic.build>
+    let savedViews: ColumnConfigurationApi[]
+
+    beforeEach(() => {
+        savedViews = []
+        useMocks({
+            get: {
+                '/api/organizations/:organization_id/members/': () => [200, { results: [] }],
+                '/api/projects/:team_id/tags': () => [200, []],
+                '/api/projects/:team_id/column_configurations': () => [
+                    200,
+                    { count: savedViews.length, results: savedViews },
+                ],
+            },
+        })
+        initKeaTests()
+        // The shared "my accounts" (mineOnly) toggle persists to localStorage; clear it so a
+        // value set by one test can't bleed into the next (which would pre-check the checkbox).
+        localStorage.clear()
+        logic = accountsLogic()
+        logic.mount()
+    })
+
+    afterEach(() => {
+        logic.unmount()
+        cleanup()
+        localStorage.clear()
+    })
+
+    function renderFilters(): void {
+        render(
+            <Provider>
+                <BindLogic
+                    logic={dataNodeLogic}
+                    props={{ key: ACCOUNTS_TABLE_DATA_NODE_KEY, query: {}, autoLoad: false }}
+                >
+                    <AccountsTabFilters />
+                </BindLogic>
+            </Provider>
+        )
+    }
+
+    function myAccountsCheckbox(): HTMLInputElement {
+        return screen.getByText('My accounts').closest('.LemonCheckbox')!.querySelector('input')!
+    }
+
+    it('offers edit and delete for a shared saved view', async () => {
+        savedViews = [
+            {
+                id: 'shared-view',
+                context_key: 'customer_analytics_accounts_columns',
+                columns: ['name'],
+                name: 'Shared accounts',
+                filters: {},
+                order_by: [],
+                properties: {},
+                visibility: 'shared',
+                created_by: 999,
+                created_at: '2026-01-01T00:00:00Z',
+                updated_at: '2026-01-01T00:00:00Z',
+            },
+        ]
+        renderFilters()
+
+        fireEvent.click(await screen.findByText('Select view'))
+
+        const sharedViewLabel = await screen.findByText('Shared accounts')
+        const viewMenuItem = sharedViewLabel.closest('li')
+        expect(viewMenuItem).not.toBeNull()
+
+        const viewButtons = viewMenuItem!.querySelectorAll('button')
+        expect(viewButtons).toHaveLength(2)
+        fireEvent.click(viewButtons[1])
+
+        expect(await screen.findByText('Edit')).toBeInTheDocument()
+        expect(screen.getByText('Delete')).toBeInTheDocument()
+
+        fireEvent.click(screen.getByText('Edit'))
+        expect(await screen.findByText('Edit view')).toBeInTheDocument()
+        expect(screen.getByDisplayValue('Shared accounts')).toBeInTheDocument()
+    })
+
+    it('renders the "My accounts" checkbox', () => {
+        renderFilters()
+
+        expect(screen.getByText('My accounts')).toBeInTheDocument()
+        expect(myAccountsCheckbox().checked).toBe(false)
+    })
+
+    it('reflects a restored my-accounts filter as checked', () => {
+        userLogic.actions.loadUserSuccess({ id: 42 } as unknown as UserType)
+        logic.actions.setAssignedToCurrentUser(true)
+        renderFilters()
+
+        expect(myAccountsCheckbox().checked).toBe(true)
+    })
+
+    it('clicking it enables the my-accounts filter (resolved to the current user id)', () => {
+        userLogic.actions.loadUserSuccess({ id: 42 } as unknown as UserType)
+        renderFilters()
+
+        fireEvent.click(myAccountsCheckbox())
+
+        expect(logic.values.assignedToFilter).toEqual([42])
+        expect(logic.values.assignedToCurrentUser).toBe(true)
+    })
+
+    it('renders the "Assigned to" picker with its default label', () => {
+        renderFilters()
+
+        // Default shows every account regardless of assignment.
+        expect(screen.getByText('All accounts')).toBeInTheDocument()
+    })
+
+    it('updates the Accounts assignment status from the shared picker', () => {
+        renderFilters()
+
+        fireEvent.click(screen.getByText('All accounts'))
+        fireEvent.click(screen.getByText('Assigned to anyone'))
+
+        expect(logic.values.assignmentStatus).toBe('assigned')
+    })
+})

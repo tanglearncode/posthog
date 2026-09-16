@@ -1,0 +1,537 @@
+import time
+from dataclasses import dataclass
+from typing import Literal, Optional, overload
+
+import structlog
+import pydantic_core
+from pydantic import BaseModel
+from rest_framework.exceptions import APIException, ValidationError
+
+from posthog.schema import (
+    DashboardFilter,
+    DatabaseSchemaQuery,
+    DatabaseSchemaQueryResponse,
+    DataWarehouseViewLink,
+    HogQLAutocomplete,
+    HogQLAutocompleteResponse,
+    HogQLMetadata,
+    HogQLMetadataResponse,
+    HogQLNotice,
+    HogQLVariable,
+    HogQuery,
+    HogQueryResponse,
+    QuerySchemaRoot,
+    QueryTiming,
+)
+
+from posthog.hogql.autocomplete import get_hogql_autocomplete
+from posthog.hogql.compiler.bytecode import execute_hog
+from posthog.hogql.constants import LimitContext
+from posthog.hogql.context import HogQLContext
+from posthog.hogql.direct_connection import resolve_database_for_connection
+from posthog.hogql.editor_assist_metrics import EDITOR_ASSIST_DURATION_SECONDS
+from posthog.hogql.errors import ExposedHogQLError, ResolutionError
+from posthog.hogql.language_service import (
+    CatalogMissing,
+    LanguageServiceClient,
+    LanguageServiceError,
+    LanguageServiceResult,
+    build_catalog,
+    is_language_service_enabled,
+)
+from posthog.hogql.metadata import get_hogql_metadata
+from posthog.hogql.modifiers import create_default_modifiers_for_team
+
+from posthog.clickhouse.query_tagging import tag_queries
+from posthog.cloud_utils import is_cloud
+from posthog.event_usage import AnalyticsProps
+from posthog.exceptions import DatabaseSchemaUnavailable
+from posthog.exceptions_capture import capture_exception
+from posthog.hogql_queries.query_runner import (
+    CacheMissResponse,
+    ExecutionMode,
+    QueryResponse,
+    QueryRunner,
+    get_query_runner_or_none,
+)
+from posthog.models import Team, User
+from posthog.schema_migrations.upgrade import upgrade
+
+from products.access_control.backend.facade.user_access_control import UserAccessControl, UserAccessControlError
+from products.data_tools.backend.models.join import DataWarehouseJoin
+
+from common.hogvm.python.debugger import color_bytecode
+
+logger = structlog.get_logger(__name__)
+
+
+def _language_service_eligible(query: HogQLAutocomplete | HogQLMetadata) -> bool:
+    common = (
+        query.language.value == "hogQL"
+        and query.connectionId is None
+        and query.sourceQuery is None
+        and query.globals is None
+        and query.filters is None
+        and query.modifiers is None
+    )
+    if isinstance(query, HogQLMetadata):
+        return common and query.variables is None and not query.debug
+    return common
+
+
+def _language_service_call(
+    team: Team, user: User, query: HogQLAutocomplete | HogQLMetadata
+) -> LanguageServiceResult | None:
+    if not _language_service_eligible(query) or not is_language_service_enabled(team, user):
+        return None
+    try:
+        client = LanguageServiceClient()
+
+        def call() -> LanguageServiceResult:
+            if isinstance(query, HogQLAutocomplete):
+                return client.autocomplete(team.pk, user.pk, query.query, query.endPosition)
+            return client.validate(team.pk, user.pk, query.query)
+
+        result = call()
+    except CatalogMissing:
+        try:
+            schema = process_database_schema_query(team, DatabaseSchemaQuery(), user=user)
+            client.publish(team.pk, user.pk, str(time.time_ns()), build_catalog(team, user, schema))
+            result = call()
+        except LanguageServiceError:
+            return None
+    except LanguageServiceError:
+        return None
+    return result
+
+
+@dataclass(frozen=True)
+class RawCachedQueryResponse:
+    """A cached query response whose `results` field is carried as raw JSON bytes.
+
+    `response.results` holds an empty-list placeholder; `raw_results` is the JSON-encoded
+    results segment straight from the cache, ready to be embedded into a JSON response
+    (e.g. via orjson.Fragment) without a parse/re-serialize round trip. Only produced when
+    a caller passes allow_raw_results=True.
+    """
+
+    response: BaseModel
+    raw_results: bytes
+
+
+# The overloads keep the public contract at `dict | BaseModel` for the vast majority of
+# callers: only allow_raw_results=True can produce a RawCachedQueryResponse.
+@overload
+def process_query_dict(
+    team: Team,
+    query_json: dict,
+    *,
+    dashboard_filters_json: Optional[dict] = ...,
+    variables_override_json: Optional[dict] = ...,
+    limit_context: Optional[LimitContext] = ...,
+    execution_mode: ExecutionMode = ...,
+    user: Optional[User] = ...,
+    user_access_control: Optional[UserAccessControl] = ...,
+    query_id: Optional[str] = ...,
+    insight_id: Optional[int] = ...,
+    dashboard_id: Optional[int] = ...,
+    is_query_service: bool = ...,
+    cache_age_seconds: Optional[int] = ...,
+    pagination_cursor: Optional[str] = ...,
+    analytics_props: Optional[AnalyticsProps] = ...,
+    allow_raw_results: Literal[False] = ...,
+) -> dict | BaseModel: ...
+
+
+@overload
+def process_query_dict(
+    team: Team,
+    query_json: dict,
+    *,
+    dashboard_filters_json: Optional[dict] = ...,
+    variables_override_json: Optional[dict] = ...,
+    limit_context: Optional[LimitContext] = ...,
+    execution_mode: ExecutionMode = ...,
+    user: Optional[User] = ...,
+    user_access_control: Optional[UserAccessControl] = ...,
+    query_id: Optional[str] = ...,
+    insight_id: Optional[int] = ...,
+    dashboard_id: Optional[int] = ...,
+    is_query_service: bool = ...,
+    cache_age_seconds: Optional[int] = ...,
+    pagination_cursor: Optional[str] = ...,
+    analytics_props: Optional[AnalyticsProps] = ...,
+    allow_raw_results: bool,
+) -> dict | BaseModel | RawCachedQueryResponse: ...
+
+
+def process_query_dict(
+    team: Team,
+    query_json: dict,
+    *,
+    dashboard_filters_json: Optional[dict] = None,
+    variables_override_json: Optional[dict] = None,
+    limit_context: Optional[LimitContext] = None,
+    execution_mode: ExecutionMode = ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE,
+    user: Optional[User] = None,
+    user_access_control: Optional[UserAccessControl] = None,
+    query_id: Optional[str] = None,
+    insight_id: Optional[int] = None,
+    dashboard_id: Optional[int] = None,
+    is_query_service: bool = False,
+    cache_age_seconds: Optional[int] = None,
+    pagination_cursor: Optional[str] = None,
+    analytics_props: Optional[AnalyticsProps] = None,
+    allow_raw_results: bool = False,
+) -> dict | BaseModel | RawCachedQueryResponse:
+    upgraded_query_json = upgrade(query_json)
+    try:
+        model = QuerySchemaRoot.model_validate(upgraded_query_json)
+    except pydantic_core.ValidationError as e:
+        logger.exception(
+            "query_validation_error",
+            team_id=team.id,
+            dashboard_id=dashboard_id,
+            insight_id=insight_id,
+            query_id=query_id,
+            validation_error=str(e),
+        )
+        capture_exception(
+            e,
+            {
+                "team_id": team.id,
+                "dashboard_id": dashboard_id,
+                "insight_id": insight_id,
+                "query_id": query_id,
+                "error_type": "query_validation_error",
+            },
+        )
+
+        if dashboard_id:
+            raise
+
+        return QueryResponse(results=None, error=str(e))
+
+    tag_queries(query=upgraded_query_json)
+
+    dashboard_filters = DashboardFilter.model_validate(dashboard_filters_json) if dashboard_filters_json else None
+    variables_override = (
+        [HogQLVariable.model_validate(n) for n in variables_override_json.values()] if variables_override_json else None
+    )
+
+    return process_query_model(
+        team,
+        model.root,
+        dashboard_filters=dashboard_filters,
+        variables_override=variables_override,
+        limit_context=limit_context,
+        execution_mode=execution_mode,
+        user=user,
+        user_access_control=user_access_control,
+        query_id=query_id,
+        insight_id=insight_id,
+        dashboard_id=dashboard_id,
+        is_query_service=is_query_service,
+        cache_age_seconds=cache_age_seconds,
+        pagination_cursor=pagination_cursor,
+        analytics_props=analytics_props,
+        allow_raw_results=allow_raw_results,
+    )
+
+
+def process_database_schema_query(
+    team: Team, query: DatabaseSchemaQuery, *, user: Optional[User] = None
+) -> DatabaseSchemaQueryResponse:
+    try:
+        _, database = resolve_database_for_connection(
+            team,
+            query.connectionId,
+            user=user,
+            error_factory=ValidationError,
+            modifiers=create_default_modifiers_for_team(team),
+        )
+        context = HogQLContext(team_id=team.pk, team=team, database=database, user=user)
+        serialized_tables = database.serialize(
+            context,
+            include_only=set(query.tables) if query.tables else None,
+            include_hidden_posthog_tables=True,
+            include_fields=query.includeFields is not False,
+        )
+    except (APIException, ExposedHogQLError, ResolutionError, UserAccessControlError):
+        # These already carry an actionable message, and the query view maps them to a 4xx.
+        raise
+    except Exception as e:
+        # This request backs the SQL editor's table list. Untyped, it surfaces as a bare 500 with
+        # "A server error occurred.", which the sidebar can't tell apart from an empty project.
+        logger.exception(
+            "database_schema_query_failed", team_id=team.pk, connection_id=query.connectionId, error=str(e)
+        )
+        capture_exception(e, {"team_id": team.pk, "query_kind": "DatabaseSchemaQuery"})
+        raise DatabaseSchemaUnavailable() from e
+
+    table_names = set(serialized_tables.keys())
+    joins = DataWarehouseJoin.objects.filter(team_id=team.pk).exclude(deleted=True)
+    joins = joins.filter(source_table_name__in=table_names, joining_table_name__in=table_names)
+
+    join_models: list[DataWarehouseViewLink] = []
+    for join in joins.iterator():
+        join_models.append(
+            DataWarehouseViewLink.model_validate(
+                {
+                    "id": str(join.id),
+                    "source_table_name": join.source_table_name,
+                    "source_table_key": join.source_table_key,
+                    "joining_table_name": join.joining_table_name,
+                    "joining_table_key": join.joining_table_key,
+                    "field_name": join.field_name,
+                    "created_at": join.created_at.isoformat(),
+                }
+            )
+        )
+
+    return DatabaseSchemaQueryResponse(tables=serialized_tables, joins=join_models)
+
+
+@overload
+def process_query_model(
+    team: Team,
+    query: BaseModel,
+    *,
+    dashboard_filters: Optional[DashboardFilter] = ...,
+    variables_override: Optional[list[HogQLVariable]] = ...,
+    limit_context: Optional[LimitContext] = ...,
+    execution_mode: ExecutionMode = ...,
+    user: Optional[User] = ...,
+    user_access_control: Optional[UserAccessControl] = ...,
+    query_id: Optional[str] = ...,
+    insight_id: Optional[int] = ...,
+    dashboard_id: Optional[int] = ...,
+    is_query_service: bool = ...,
+    cache_age_seconds: Optional[int] = ...,
+    pagination_cursor: Optional[str] = ...,
+    analytics_props: Optional[AnalyticsProps] = ...,
+    allow_raw_results: Literal[False] = ...,
+) -> dict | BaseModel: ...
+
+
+@overload
+def process_query_model(
+    team: Team,
+    query: BaseModel,
+    *,
+    dashboard_filters: Optional[DashboardFilter] = ...,
+    variables_override: Optional[list[HogQLVariable]] = ...,
+    limit_context: Optional[LimitContext] = ...,
+    execution_mode: ExecutionMode = ...,
+    user: Optional[User] = ...,
+    user_access_control: Optional[UserAccessControl] = ...,
+    query_id: Optional[str] = ...,
+    insight_id: Optional[int] = ...,
+    dashboard_id: Optional[int] = ...,
+    is_query_service: bool = ...,
+    cache_age_seconds: Optional[int] = ...,
+    pagination_cursor: Optional[str] = ...,
+    analytics_props: Optional[AnalyticsProps] = ...,
+    allow_raw_results: bool,
+) -> dict | BaseModel | RawCachedQueryResponse: ...
+
+
+def process_query_model(
+    team: Team,
+    query: BaseModel,  # mypy has problems with unions and isinstance
+    *,
+    dashboard_filters: Optional[DashboardFilter] = None,
+    variables_override: Optional[list[HogQLVariable]] = None,
+    limit_context: Optional[LimitContext] = None,
+    execution_mode: ExecutionMode = ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE,
+    user: Optional[User] = None,
+    user_access_control: Optional[UserAccessControl] = None,
+    query_id: Optional[str] = None,
+    insight_id: Optional[int] = None,
+    dashboard_id: Optional[int] = None,
+    is_query_service: bool = False,
+    cache_age_seconds: Optional[int] = None,
+    pagination_cursor: Optional[str] = None,
+    analytics_props: Optional[AnalyticsProps] = None,
+    allow_raw_results: bool = False,
+) -> dict | BaseModel | RawCachedQueryResponse:
+    if isinstance(query, HogQLAutocomplete):
+        with EDITOR_ASSIST_DURATION_SECONDS.labels(kind="autocomplete").time():
+            if user is not None and (language_result := _language_service_call(team, user, query)) is not None:
+                body = language_result.body
+                kind_map = {
+                    "field": "Field",
+                    "function": "Function",
+                    "keyword": "Keyword",
+                    "operator": "Operator",
+                    "property": "Property",
+                    "table": "Class",
+                }
+                try:
+                    return HogQLAutocompleteResponse(
+                        suggestions=[
+                            {
+                                "label": suggestion["label"],
+                                "insertText": suggestion.get("insertText", suggestion["label"]),
+                                "kind": kind_map.get(suggestion["kind"], "Text"),
+                                "detail": suggestion.get("detail"),
+                                "sortText": suggestion.get("sortText"),
+                            }
+                            for suggestion in body["suggestions"]
+                        ],
+                        incomplete_list=bool(body.get("nextCursor")),
+                        timings=[
+                            QueryTiming(k="language_service_http", t=language_result.duration_seconds),
+                            QueryTiming(k="language_service_go", t=body["durationMicros"] / 1_000_000),
+                        ],
+                    )
+                except (KeyError, TypeError, ValueError):
+                    logger.warning("hogql_language_service_invalid_autocomplete_response")
+            _, database = resolve_database_for_connection(
+                team,
+                query.connectionId,
+                user=user,
+                error_factory=ValidationError,
+                modifiers=create_default_modifiers_for_team(team),
+                # Editor-assist only: query execution never reads cached sources.
+                use_cached_sources=True,
+            )
+            return get_hogql_autocomplete(query=query, team=team, database_arg=database, user=user)
+
+    if isinstance(query, HogQLMetadata):
+        with EDITOR_ASSIST_DURATION_SECONDS.labels(kind="metadata").time():
+            if user is not None and (language_result := _language_service_call(team, user, query)) is not None:
+                body = language_result.body
+                try:
+                    errors: list[HogQLNotice] = []
+                    warnings: list[HogQLNotice] = []
+                    for diagnostic in body["diagnostics"]:
+                        notice = HogQLNotice(
+                            message=diagnostic["message"],
+                            start=diagnostic["start"],
+                            end=diagnostic["end"],
+                            fix=diagnostic["suggestions"][0]["label"] if diagnostic.get("suggestions") else None,
+                        )
+                        if diagnostic["code"] == "unknown_property":
+                            warnings.append(notice)
+                        else:
+                            errors.append(notice)
+                    return HogQLMetadataResponse(
+                        isValid=not errors,
+                        query=query.query,
+                        errors=errors,
+                        warnings=warnings,
+                        notices=[],
+                        table_names=body.get("tableNames", []),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    logger.warning("hogql_language_service_invalid_metadata_response")
+            metadata_query = HogQLMetadata.model_validate(query)
+            return get_hogql_metadata(query=metadata_query, team=team, user=user)
+
+    if isinstance(query, DatabaseSchemaQuery):
+        return process_database_schema_query(team, query, user=user)
+
+    query_runner = get_query_runner_or_none(
+        query, team, limit_context=limit_context, user=user, user_access_control=user_access_control
+    )
+    if query_runner is not None:  # Query runner available - it will handle execution as well as caching
+        return _run_query_runner(
+            query_runner,
+            dashboard_filters=dashboard_filters,
+            variables_override=variables_override,
+            execution_mode=execution_mode,
+            user=user,
+            query_id=query_id,
+            insight_id=insight_id,
+            dashboard_id=dashboard_id,
+            is_query_service=is_query_service,
+            cache_age_seconds=cache_age_seconds,
+            pagination_cursor=pagination_cursor,
+            analytics_props=analytics_props,
+            allow_raw_results=allow_raw_results,
+        )
+
+    # This query doesn't run via query runner
+    if hasattr(query, "source") and isinstance(query.source, BaseModel):
+        return process_query_model(
+            team,
+            query.source,
+            dashboard_filters=dashboard_filters,
+            variables_override=variables_override,
+            limit_context=limit_context,
+            execution_mode=execution_mode,
+            user=user,
+            user_access_control=user_access_control,
+            query_id=query_id,
+            insight_id=insight_id,
+            dashboard_id=dashboard_id,
+            is_query_service=is_query_service,
+            cache_age_seconds=cache_age_seconds,
+            analytics_props=analytics_props,
+            allow_raw_results=allow_raw_results,
+        )
+    if execution_mode == ExecutionMode.CACHE_ONLY_NEVER_CALCULATE:
+        # Caching is handled by query runners, so in this case we can only return a cache miss
+        return CacheMissResponse(cache_key=None)
+    if isinstance(query, HogQuery):
+        return _run_hog_query(query, team, user)
+    raise ValidationError(f"Unsupported query kind: {query.__class__.__name__}")
+
+
+def _run_hog_query(query: HogQuery, team: Team, user: Optional[User]) -> dict | HogQueryResponse:
+    if is_cloud() and (user is None or not user.is_staff):
+        return {"results": "Hog queries currently require staff user privileges."}
+
+    try:
+        hog_result = execute_hog(query.code or "", team=team)
+        bytecode = hog_result.bytecodes.get("root", None)
+        return HogQueryResponse(
+            results=hog_result.result,
+            bytecode=bytecode,
+            coloredBytecode=color_bytecode(bytecode) if bytecode else None,
+            stdout="\n".join(hog_result.stdout),
+        )
+    except Exception as e:
+        return HogQueryResponse(results=f"ERROR: {str(e)}")
+
+
+def _run_query_runner(
+    query_runner: QueryRunner,
+    *,
+    dashboard_filters: Optional[DashboardFilter],
+    variables_override: Optional[list[HogQLVariable]],
+    execution_mode: ExecutionMode,
+    user: Optional[User],
+    query_id: Optional[str],
+    insight_id: Optional[int],
+    dashboard_id: Optional[int],
+    is_query_service: bool,
+    cache_age_seconds: Optional[int],
+    pagination_cursor: Optional[str],
+    analytics_props: Optional[AnalyticsProps],
+    allow_raw_results: bool,
+) -> dict | BaseModel | RawCachedQueryResponse:
+    if dashboard_filters:
+        query_runner.apply_dashboard_filters(dashboard_filters)
+    if variables_override:
+        query_runner.apply_variable_overrides(variables_override)
+    if pagination_cursor:
+        query_runner.apply_pagination_cursor(pagination_cursor)
+    query_runner.is_query_service = is_query_service
+    if allow_raw_results:
+        query_runner.serve_raw_cached_results = True
+
+    result = query_runner.run(
+        execution_mode=execution_mode,
+        user=user,
+        query_id=query_id,
+        insight_id=insight_id,
+        dashboard_id=dashboard_id,
+        cache_age_seconds=cache_age_seconds,
+        analytics_props=analytics_props,
+    )
+    raw_results = query_runner.raw_cached_results_bytes
+    if raw_results is not None and isinstance(result, BaseModel):
+        return RawCachedQueryResponse(response=result, raw_results=raw_results)
+    return result
