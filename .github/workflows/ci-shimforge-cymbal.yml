@@ -1,0 +1,154 @@
+name: Fork Cymbal Shimforge verification
+
+on:
+    push:
+        branches: ['verify/shimforge-f5ddf79']
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: false
+
+env:
+    # The upstream PR head under test. The checkout step uses this commit, not the branch tip.
+    TESTED_SHA: f5ddf79f58f9cc414d0e399dabbc88cbf43b534a
+
+jobs:
+    verify:
+        if: github.repository == 'tanglearncode/posthog'
+        runs-on: ubuntu-24.04
+        timeout-minutes: 120
+        defaults:
+            run:
+                shell: bash
+                working-directory: rust
+        env:
+            DATABASE_URL: postgres://posthog:posthog@localhost:5432/posthog
+            KAFKA_HOSTS: localhost:9092
+            KAFKA_TLS: 'false'
+            AWS_EC2_METADATA_DISABLED: 'true'
+            CARGO_BUILD_JOBS: '2'
+            CARGO_PROFILE_TEST_DEBUG: '1'
+            CARGO_PROFILE_TEST_INCREMENTAL: 'false'
+            RUST_BACKTRACE: '1'
+        services:
+            postgres:
+                image: postgres:16
+                env:
+                    POSTGRES_USER: posthog
+                    POSTGRES_PASSWORD: posthog
+                    POSTGRES_DB: posthog
+                ports: ['5432:5432']
+                options: >-
+                    --health-cmd "pg_isready -U posthog"
+                    --health-interval 5s
+                    --health-timeout 5s
+                    --health-retries 12
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  ref: ${{ env.TESTED_SHA }}
+                  persist-credentials: false
+                  sparse-checkout: |
+                      /rust/
+                      /proto/
+                      /.github/actions/setup-protoc/
+                  sparse-checkout-cone-mode: false
+
+            - name: Confirm tested commit
+              run: |
+                  actual=$(git rev-parse HEAD)
+                  echo "Tested commit: $actual"
+                  test "$actual" = "$TESTED_SHA"
+                  grep -A1 '^name = "shimforge' Cargo.lock
+                  grep -n '^shimforge' cymbal/Cargo.toml
+                  {
+                    echo "Tested commit: \`$actual\`"
+                    echo
+                    echo '```'
+                    grep -A1 '^name = "shimforge' Cargo.lock
+                    echo '```'
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Prepare native build dependencies
+              run: |
+                  # These unused hosted-runner SDKs otherwise crowd out the Rust build.
+                  sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+                  sudo apt-get update
+                  sudo apt-get install -y clang cmake libclang-dev libssl-dev libsasl2-dev pkg-config
+                  df -h .
+
+            - name: Install Rust
+              uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+              with:
+                  toolchain: 1.91.1
+                  components: rustfmt
+
+            - name: Install protoc
+              uses: ./.github/actions/setup-protoc
+
+            - name: Start Kafka-compatible broker
+              run: |
+                  docker run -d --name cymbal-kafka -p 9092:9092 \
+                    redpandadata/redpanda:v24.3.6 \
+                    redpanda start --mode dev-container --smp 1 --memory 512M \
+                    --kafka-addr 0.0.0.0:9092 --advertise-kafka-addr localhost:9092
+                  for attempt in $(seq 1 60); do
+                    if docker exec cymbal-kafka rpk cluster info -X brokers=localhost:9092; then
+                      exit 0
+                    fi
+                    sleep 2
+                  done
+                  docker logs cymbal-kafka
+                  exit 1
+
+            - name: Check test formatting
+              run: rustfmt --edition 2021 --config skip_children=true --check cymbal/tests/posthog_capture.rs
+
+            - name: Build the complete Cymbal test
+              run: |
+                  cargo test --locked -p cymbal --test posthog_capture --no-run --message-format=json \
+                    > "$RUNNER_TEMP/cymbal-build.json" 2> >(tee "$RUNNER_TEMP/cymbal-build.log" >&2)
+                  jq -s -r '
+                    [.[] | select(.reason == "compiler-artifact" and .target.name == "posthog_capture")
+                     | .executable | select(. != null)] | unique
+                    | if length == 1 then .[0] else error("expected one Cymbal test binary") end
+                  ' "$RUNNER_TEMP/cymbal-build.json" > "$RUNNER_TEMP/cymbal-test-binary"
+
+            - name: Verify the full test in 50 independent runs
+              working-directory: rust/cymbal
+              run: |
+                  binary=$(cat "$RUNNER_TEMP/cymbal-test-binary")
+                  "$binary" --list | tee "$RUNNER_TEMP/cymbal-test-list.log"
+                  grep -Fx 'pipeline_failure_is_captured_as_posthog_exception: test' "$RUNNER_TEMP/cymbal-test-list.log"
+                  for attempt in $(seq 1 50); do
+                    echo "Cymbal run $attempt/50" | tee -a "$RUNNER_TEMP/cymbal-test.log"
+                    timeout 120s "$binary" --exact pipeline_failure_is_captured_as_posthog_exception --nocapture \
+                      2>&1 | tee -a "$RUNNER_TEMP/cymbal-test.log"
+                  done
+                  echo 'Cymbal integration test: 50/50 independent runs passed.' >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Verify shared telemetry delivery coverage
+              run: |
+                  cargo test --locked -p common-posthog --test panic_capture -- --nocapture \
+                    2>&1 | tee "$RUNNER_TEMP/shared-telemetry-test.log"
+
+            - name: Capture service diagnostics
+              if: failure()
+              run: |
+                  df -h
+                  docker ps -a
+                  docker logs cymbal-kafka > "$RUNNER_TEMP/cymbal-kafka.log" 2>&1 || true
+
+            - name: Upload verification logs
+              if: '!cancelled()'
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: cymbal-shimforge-verification
+                  retention-days: 7
+                  path: |
+                      ${{ runner.temp }}/cymbal-*.log
+                      ${{ runner.temp }}/shared-telemetry-test.log
